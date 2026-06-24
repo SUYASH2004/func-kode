@@ -83,6 +83,9 @@ export async function aggregateDeveloperMetrics(
 
   // -----------------------------------------------------------------------
   // 2. Fetch pr_events from the last WINDOW_DAYS days.
+  //    Filter on `updated_at` (PR activity time) rather than `ingested_at`
+  //    (webhook processing time) so late webhook deliveries are not excluded
+  //    from the window when the underlying PR activity was within 90 days.
   // -----------------------------------------------------------------------
   const windowStart = new Date(Date.now() - WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
@@ -94,7 +97,7 @@ export async function aggregateDeveloperMetrics(
         "requested_reviewers_count, tests_touched, docs_touched, risky_paths_hit",
     )
     .eq("developer_id", developerId)
-    .gte("ingested_at", windowStart.toISOString())
+    .gte("updated_at", windowStart.toISOString())
     .returns<PrEventRow[]>();
 
   if (queryError) {
@@ -109,22 +112,97 @@ export async function aggregateDeveloperMetrics(
   // 3. Reduce into DeveloperMetrics.
   // -----------------------------------------------------------------------
   // Each distinct PR can appear as multiple event rows (opened, edited,
-  // synchronized, reviewed, merged, closed).  We deduplicate by github_pt_id
-  // and pick the **latest** row per PR (by updated_at) as the source of
-  // truth for that PR's metrics.
-  const prsByGitHubId = new Map<number, PrEventRow>();
+  // synchronized, reviewed, merged, closed).  Instead of keeping only the
+  // latest row (which can lose merge/review state from earlier events), we
+  // accumulate per-PR state across ALL its event rows so that merge, review,
+  // hygiene, and churn signals are never discarded.
+  interface PrAccumulator {
+    github_pt_id: number;
+    is_merged: boolean;
+    is_closed: boolean;
+    has_review_requested: boolean;
+    has_review_received: boolean;
+    risky_paths_hit: boolean;
+    tests_touched: boolean;
+    docs_touched: boolean;
+    additions: number | null;
+    deletions: number | null;
+    changed_files: number | null;
+    latestTimestamp: number | null;
+    activeWeeks: Set<string>;
+  }
+
+  const prsByGitHubId = new Map<number, PrAccumulator>();
 
   for (const row of events) {
-    const existing = prsByGitHubId.get(row.github_pt_id);
-    if (!existing) {
-      prsByGitHubId.set(row.github_pt_id, row);
-      continue;
+    let pr = prsByGitHubId.get(row.github_pt_id);
+    if (!pr) {
+      pr = {
+        github_pt_id: row.github_pt_id,
+        is_merged: false,
+        is_closed: false,
+        has_review_requested: false,
+        has_review_received: false,
+        risky_paths_hit: false,
+        tests_touched: false,
+        docs_touched: false,
+        additions: null,
+        deletions: null,
+        changed_files: null,
+        latestTimestamp: null,
+        activeWeeks: new Set<string>(),
+      };
+      prsByGitHubId.set(row.github_pt_id, pr);
     }
-    // Keep the row with the most recent updated_at (or created_at fallback).
-    const existingTs = Date.parse(existing.updated_at ?? existing.created_at ?? "");
-    const currentTs = Date.parse(row.updated_at ?? row.created_at ?? "");
-    if (currentTs >= existingTs) {
-      prsByGitHubId.set(row.github_pt_id, row);
+
+    // Merge / close state — accumulate across all events for this PR.
+    // A "merged" event or any row with merged_at set means the PR was merged.
+    if (row.event_type === "merged" || row.merged_at !== null) {
+      pr.is_merged = true;
+    }
+    // A "closed" event without a merge means closed-without-merge.
+    if (row.event_type === "closed" && row.merged_at === null) {
+      pr.is_closed = true;
+    }
+
+    // Review participation — accumulate across all events.
+    if ((row.requested_reviewers_count ?? 0) > 0) {
+      pr.has_review_requested = true;
+    }
+    if ((row.review_count ?? 0) > 0) {
+      pr.has_review_received = true;
+    }
+
+    // Hygiene — a PR is flagged if ANY event row indicates it.
+    if (row.risky_paths_hit) {
+      pr.risky_paths_hit = true;
+    }
+    if (row.tests_touched) {
+      pr.tests_touched = true;
+    }
+    if (row.docs_touched) {
+      pr.docs_touched = true;
+    }
+
+    // Churn — prefer the row with non-null diff stats; if a later
+    // synchronized event has null stats we keep the earlier values.
+    if (row.additions !== null) pr.additions = row.additions;
+    if (row.deletions !== null) pr.deletions = row.deletions;
+    if (row.changed_files !== null) pr.changed_files = row.changed_files;
+
+    // Recency — track the latest timestamp across all events for this PR.
+    const ts = row.updated_at ?? row.created_at;
+    if (ts) {
+      const parsed = Date.parse(ts);
+      if (!Number.isNaN(parsed)) {
+        if (pr.latestTimestamp === null || parsed > pr.latestTimestamp) {
+          pr.latestTimestamp = parsed;
+        }
+        // ISO week key: "YYYY-W##"
+        const date = new Date(parsed);
+        const weekKey = getIsoWeekKey(date);
+        pr.activeWeeks.add(weekKey);
+      }
     }
   }
 
@@ -157,18 +235,18 @@ export async function aggregateDeveloperMetrics(
   const activeWeeksSet = new Set<string>();
 
   for (const pr of distinctPrs) {
-    // Merge / close state — determined by the latest event for this PR.
-    if (pr.event_type === "merged" || pr.merged_at !== null) {
+    // Merge / close state — accumulated across all events.
+    if (pr.is_merged) {
       merged_prs++;
-    } else if (pr.event_type === "closed" && pr.merged_at === null) {
+    } else if (pr.is_closed) {
       closed_without_merge++;
     }
 
     // Review participation
-    if ((pr.requested_reviewers_count ?? 0) > 0) {
+    if (pr.has_review_requested) {
       prs_with_review_requested++;
     }
-    if ((pr.review_count ?? 0) > 0) {
+    if (pr.has_review_received) {
       prs_with_review_received++;
     }
 
@@ -196,18 +274,13 @@ export async function aggregateDeveloperMetrics(
       churnPrCount++;
     }
 
-    // Recency — use updated_at if available, else created_at
-    const ts = pr.updated_at ?? pr.created_at;
-    if (ts) {
-      const parsed = Date.parse(ts);
-      if (!Number.isNaN(parsed)) {
-        if (lastPrTimestamp === null || parsed > lastPrTimestamp) {
-          lastPrTimestamp = parsed;
-        }
-
-        // ISO week key: "YYYY-W##"
-        const date = new Date(parsed);
-        const weekKey = getIsoWeekKey(date);
+    // Recency — use the latest timestamp across all events for this PR.
+    if (pr.latestTimestamp !== null) {
+      if (lastPrTimestamp === null || pr.latestTimestamp > lastPrTimestamp) {
+        lastPrTimestamp = pr.latestTimestamp;
+      }
+      // Aggregate active weeks across all PRs.
+      for (const weekKey of pr.activeWeeks) {
         activeWeeksSet.add(weekKey);
       }
     }

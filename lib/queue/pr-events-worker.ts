@@ -3,12 +3,14 @@
  *
  * BullMQ worker that consumes jobs from the `pr-events` queue.
  *
+ * Normalization (GitHub API enrichment, developer resolution, path analysis)
+ * is performed at the webhook/API route before enqueuing, so jobs arrive
+ * already normalized as `PrEventJob` payloads.
+ *
  * Pipeline per job:
- *   1. Normalize the raw webhook payload → NormalizedPREvent
- *      (GitHub API enrichment + developer resolution + path analysis)
- *   2. Persist the normalized event into the `pr_events` table
- *      (idempotent - skips on duplicate idempotency_key)
- *   3. If a developer_id was resolved, recompute and persist their score
+ *   1. Persist the pre-normalized event into the `pr_events` table
+ *      (idempotent — skips on duplicate idempotency_key / delivery_id)
+ *   2. If a developer_id was resolved, recompute and persist their score
  *      via saveDeveloperScore()
  *
  * Run this as a long-lived process outside Next.js:
